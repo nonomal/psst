@@ -11,6 +11,7 @@ mod promise;
 mod recommend;
 mod search;
 mod show;
+mod slider_scroll_scale;
 mod track;
 mod user;
 pub mod utils;
@@ -22,7 +23,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use druid::{
@@ -32,7 +33,7 @@ use druid::{
 use psst_core::{item_id::ItemId, session::SessionService};
 
 pub use crate::data::{
-    album::{Album, AlbumDetail, AlbumLink, AlbumType, Copyright, CopyrightType},
+    album::{Album, AlbumDetail, AlbumLink, AlbumType},
     artist::{Artist, ArtistAlbums, ArtistDetail, ArtistLink, ArtistTracks},
     config::{AudioQuality, Authentication, Config, Preferences, PreferencesTab, Theme},
     ctx::Ctx,
@@ -42,7 +43,10 @@ pub use crate::data::{
         NowPlaying, Playable, PlayableMatcher, Playback, PlaybackOrigin, PlaybackPayload,
         PlaybackState, QueueBehavior, QueueEntry,
     },
-    playlist::{Playlist, PlaylistAddTrack, PlaylistDetail, PlaylistLink, PlaylistTracks},
+    playlist::{
+        Playlist, PlaylistAddTrack, PlaylistDetail, PlaylistLink, PlaylistRemoveTrack,
+        PlaylistTracks,
+    },
     promise::{Promise, PromiseState},
     recommend::{
         Range, Recommend, Recommendations, RecommendationsKnobs, RecommendationsParams,
@@ -50,16 +54,18 @@ pub use crate::data::{
     },
     search::{Search, SearchResults, SearchTopic},
     show::{Episode, EpisodeId, EpisodeLink, Show, ShowDetail, ShowEpisodes, ShowLink},
-    track::{AudioAnalysis, AudioSegment, TimeInterval, Track, TrackId},
-    user::UserProfile,
+    slider_scroll_scale::SliderScrollScale,
+    track::{AudioAnalysis, Track, TrackId},
+    user::{PublicUser, UserProfile},
     utils::{Cached, Float64, Image, Page},
 };
+
+pub const ALERT_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Data, Lens)]
 pub struct AppState {
     #[data(ignore)]
     pub session: SessionService,
-
     pub nav: Nav,
     pub history: Vector<Nav>,
     pub config: Config,
@@ -73,9 +79,10 @@ pub struct AppState {
     pub show_detail: ShowDetail,
     pub library: Arc<Library>,
     pub common_ctx: Arc<CommonCtx>,
-    pub personalized: Personalized,
+    pub home_detail: HomeDetail,
     pub alerts: Vector<Alert>,
     pub finder: Finder,
+    pub added_queue: Vector<QueueEntry>,
 }
 
 impl AppState {
@@ -109,11 +116,13 @@ impl AppState {
                 auth: Authentication {
                     username: String::new(),
                     password: String::new(),
+                    access_token: String::new(),
                     result: Promise::Empty,
                 },
                 cache_size: Promise::Empty,
             },
             playback,
+            added_queue: Vector::new(),
             search: Search {
                 input: "".into(),
                 results: Promise::Empty,
@@ -121,6 +130,18 @@ impl AppState {
             recommend: Recommend {
                 knobs: Default::default(),
                 results: Promise::Empty,
+            },
+            home_detail: HomeDetail {
+                made_for_you: Promise::Empty,
+                user_top_mixes: Promise::Empty,
+                best_of_artists: Promise::Empty,
+                recommended_stations: Promise::Empty,
+                your_shows: Promise::Empty,
+                shows_that_you_might_like: Promise::Empty,
+                uniquely_yours: Promise::Empty,
+                jump_back_in: Promise::Empty,
+                user_top_tracks: Promise::Empty,
+                user_top_artists: Promise::Empty,
             },
             album_detail: AlbumDetail {
                 album: Promise::Empty,
@@ -141,9 +162,6 @@ impl AppState {
             },
             library,
             common_ctx,
-            personalized: Personalized {
-                made_for_you: Promise::Empty,
-            },
             alerts: Vector::new(),
             finder: Finder::new(),
         }
@@ -153,29 +171,49 @@ impl AppState {
 impl AppState {
     pub fn navigate(&mut self, nav: &Nav) {
         if &self.nav != nav {
-            let previous = mem::replace(&mut self.nav, nav.to_owned());
+            let previous: Nav = mem::replace(&mut self.nav, nav.to_owned());
             self.history.push_back(previous);
             self.config.last_route.replace(nav.to_owned());
-            self.config.save();
         }
     }
 
     pub fn navigate_back(&mut self) {
         if let Some(nav) = self.history.pop_back() {
             self.config.last_route.replace(nav.clone());
-            self.config.save();
             self.nav = nav;
         }
+    }
+
+    pub fn refresh(&mut self) {
+        let current: Nav = mem::replace(&mut self.nav, Nav::Home);
+        self.nav = current;
     }
 }
 
 impl AppState {
     pub fn queued_entry(&self, item_id: ItemId) -> Option<QueueEntry> {
-        self.playback
+        if let Some(queued) = self
+            .playback
             .queue
             .iter()
             .find(|queued| queued.item.id() == item_id)
             .cloned()
+        {
+            Some(queued)
+        } else if let Some(queued) = self
+            .added_queue
+            .iter()
+            .find(|queued| queued.item.id() == item_id)
+            .cloned()
+        {
+            return Some(queued);
+        } else {
+            None
+        }
+    }
+
+    pub fn add_queued_entry(&mut self, queue_entry: QueueEntry) {
+        self.added_queue.push_back(queue_entry);
     }
 
     pub fn loading_playback(&mut self, item: Playable, origin: PlaybackOrigin) {
@@ -250,24 +288,32 @@ impl AppState {
 }
 
 impl AppState {
-    pub fn info_alert(&mut self, message: impl Display) {
-        self.alerts.push_back(Alert {
+    pub fn add_alert(&mut self, message: impl Display, style: AlertStyle) {
+        let alert = Alert {
             message: message.to_string().into(),
-            style: AlertStyle::Info,
+            style,
             id: Alert::fresh_id(),
-        });
+            created_at: Instant::now(),
+        };
+        self.alerts.push_back(alert);
+    }
+
+    pub fn info_alert(&mut self, message: impl Display) {
+        self.add_alert(message, AlertStyle::Info);
     }
 
     pub fn error_alert(&mut self, message: impl Display) {
-        self.alerts.push_back(Alert {
-            message: message.to_string().into(),
-            style: AlertStyle::Error,
-            id: Alert::fresh_id(),
-        });
+        self.add_alert(message, AlertStyle::Error);
     }
 
     pub fn dismiss_alert(&mut self, id: usize) {
         self.alerts.retain(|a| a.id != id);
+    }
+
+    pub fn cleanup_alerts(&mut self) {
+        let now = Instant::now();
+        self.alerts
+            .retain(|alert| now.duration_since(alert.created_at) < ALERT_DURATION);
     }
 }
 
@@ -364,12 +410,57 @@ impl Library {
         }
     }
 
-    pub fn increment_playlist_track_count(&mut self, link: &PlaylistLink) {
+    pub fn add_playlist(&mut self, playlist: Playlist) {
+        if let Some(playlists) = self.playlists.resolved_mut() {
+            playlists.push_back(playlist);
+        }
+    }
+
+    pub fn remove_from_playlist(&mut self, id: &str) {
+        if let Some(playlists) = self.playlists.resolved_mut() {
+            playlists.retain(|p| p.id.as_ref() != id);
+        }
+    }
+
+    pub fn rename_playlist(&mut self, link: PlaylistLink) {
         if let Some(saved) = self.playlists.resolved_mut() {
             for playlist in saved.iter_mut() {
                 if playlist.id == link.id {
-                    playlist.track_count += 1;
+                    playlist.name = link.name;
+                    break;
                 }
+            }
+        }
+    }
+
+    pub fn is_created_by_user(&self, playlist: &Playlist) -> bool {
+        if let Some(profile) = self.user_profile.resolved() {
+            profile.id == playlist.owner.id
+        } else {
+            false
+        }
+    }
+
+    pub fn contains_playlist(&self, playlist: &Playlist) -> bool {
+        if let Some(playlists) = self.playlists.resolved() {
+            playlists.iter().any(|p| p.id == playlist.id)
+        } else {
+            false
+        }
+    }
+
+    pub fn increment_playlist_track_count(&mut self, link: &PlaylistLink) {
+        if let Some(saved) = self.playlists.resolved_mut() {
+            if let Some(playlist) = saved.iter_mut().find(|p| p.id == link.id) {
+                playlist.track_count = playlist.track_count.map(|count| count + 1);
+            }
+        }
+    }
+
+    pub fn decrement_playlist_track_count(&mut self, link: &PlaylistLink) {
+        if let Some(saved) = self.playlists.resolved_mut() {
+            if let Some(playlist) = saved.iter_mut().find(|p| p.id == link.id) {
+                playlist.track_count = playlist.track_count.map(|count| count.saturating_sub(1));
             }
         }
     }
@@ -430,8 +521,26 @@ impl CommonCtx {
 pub type WithCtx<T> = Ctx<Arc<CommonCtx>, T>;
 
 #[derive(Clone, Data, Lens)]
-pub struct Personalized {
-    pub made_for_you: Promise<Vector<Playlist>>,
+pub struct HomeDetail {
+    pub made_for_you: Promise<MixedView>,
+    pub user_top_mixes: Promise<MixedView>,
+    pub best_of_artists: Promise<MixedView>,
+    pub recommended_stations: Promise<MixedView>,
+    pub uniquely_yours: Promise<MixedView>,
+    pub your_shows: Promise<MixedView>,
+    pub shows_that_you_might_like: Promise<MixedView>,
+    pub jump_back_in: Promise<MixedView>,
+    pub user_top_tracks: Promise<Vector<Arc<Track>>>,
+    pub user_top_artists: Promise<Vector<Artist>>,
+}
+
+#[derive(Clone, Data, Lens)]
+pub struct MixedView {
+    pub title: Arc<str>,
+    pub playlists: Vector<Playlist>,
+    pub artists: Vector<Artist>,
+    pub albums: Vector<Arc<Album>>,
+    pub shows: Vector<Arc<Show>>,
 }
 
 static ALERT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -441,6 +550,7 @@ pub struct Alert {
     pub id: usize,
     pub message: Arc<str>,
     pub style: AlertStyle,
+    pub created_at: Instant,
 }
 
 impl Alert {

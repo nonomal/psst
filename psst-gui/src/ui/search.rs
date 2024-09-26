@@ -6,20 +6,21 @@ use druid::{
     Data, LensExt, Selector, Widget, WidgetExt,
 };
 
-use crate::data::Show;
-use crate::ui::show;
 use crate::{
     cmd,
     controller::InputController,
     data::{
-        Album, AppState, Artist, Ctx, Nav, Playlist, Search, SearchResults, SearchTopic,
-        SpotifyUrl, WithCtx,
+        Album, AppState, Artist, Ctx, Nav, Search, SearchResults, SearchTopic, Show, SpotifyUrl,
+        WithCtx,
     },
+    ui::show,
     webapi::WebApi,
     widget::{Async, Empty, MyWidgetExt},
 };
 
 use super::{album, artist, playable, playlist, theme, track, utils};
+
+const NUMBER_OF_RESULTS_PER_TOPIC: usize = 5;
 
 pub const LOAD_RESULTS: Selector<Arc<str>> = Selector::new("app.search.load-results");
 pub const OPEN_LINK: Selector<SpotifyUrl> = Selector::new("app.search.open-link");
@@ -50,7 +51,7 @@ pub fn results_widget() -> impl Widget<AppState> {
     )
     .on_command_async(
         LOAD_RESULTS,
-        |q| WebApi::global().search(&q, SearchTopic::all()),
+        |q| WebApi::global().search(&q, SearchTopic::all(), NUMBER_OF_RESULTS_PER_TOPIC),
         |_, data, q| data.search.results.defer(q),
         |_, data, r| data.search.results.update(r),
     )
@@ -100,7 +101,7 @@ fn artist_results_widget() -> impl Widget<WithCtx<SearchResults>> {
         Empty,
         Flex::column()
             .with_child(header_widget("Artists"))
-            .with_child(List::new(artist::artist_widget)),
+            .with_child(List::new(|| artist::artist_widget(false))),
     )
     .lens(Ctx::data().then(SearchResults::artists))
 }
@@ -111,7 +112,7 @@ fn album_results_widget() -> impl Widget<WithCtx<SearchResults>> {
         Empty,
         Flex::column()
             .with_child(header_widget("Albums"))
-            .with_child(List::new(album::album_widget)),
+            .with_child(List::new(|| album::album_widget(false))),
     )
     .lens(Ctx::map(SearchResults::albums))
 }
@@ -136,13 +137,15 @@ fn track_results_widget() -> impl Widget<WithCtx<SearchResults>> {
 
 fn playlist_results_widget() -> impl Widget<WithCtx<SearchResults>> {
     Either::new(
-        |playlists: &Vector<Playlist>, _| playlists.is_empty(),
+        |playlists: &WithCtx<SearchResults>, _| playlists.data.playlists.is_empty(),
         Empty,
         Flex::column()
             .with_child(header_widget("Playlists"))
-            .with_child(List::new(playlist::playlist_widget)),
+            .with_child(
+                List::new(|| playlist::playlist_widget(false))
+                    .lens(Ctx::map(SearchResults::playlists)),
+            ),
     )
-    .lens(Ctx::data().then(SearchResults::playlists))
 }
 
 fn show_results_widget() -> impl Widget<WithCtx<SearchResults>> {
@@ -151,7 +154,7 @@ fn show_results_widget() -> impl Widget<WithCtx<SearchResults>> {
         Empty,
         Flex::column()
             .with_child(header_widget("Podcasts"))
-            .with_child(List::new(show::show_widget)),
+            .with_child(List::new(|| show::show_widget(false))),
     )
     .lens(Ctx::map(SearchResults::shows))
 }

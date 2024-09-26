@@ -1,6 +1,11 @@
+use std::io::{BufReader, BufWriter};
 use std::{env, env::VarError, fs::File, path::PathBuf};
 
-use druid::{Data, Lens};
+use std::fs::OpenOptions;
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::OpenOptionsExt;
+
+use druid::{Data, Lens, Size};
 use platform_dirs::AppDirs;
 use psst_core::{
     cache::mkdir_if_not_exists,
@@ -10,7 +15,9 @@ use psst_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{Nav, Promise, QueueBehavior};
+use crate::ui::theme;
+
+use super::{Nav, Promise, QueueBehavior, SliderScrollScale};
 
 #[derive(Clone, Debug, Data, Lens)]
 pub struct Preferences {
@@ -26,7 +33,7 @@ impl Preferences {
     }
 
     pub fn measure_cache_usage() -> Option<u64> {
-        Config::cache_dir().and_then(|path| fs_extra::dir::get_size(&path).ok())
+        Config::cache_dir().and_then(|path| fs_extra::dir::get_size(path).ok())
     }
 }
 
@@ -35,22 +42,28 @@ pub enum PreferencesTab {
     General,
     Account,
     Cache,
+    About,
 }
 
 #[derive(Clone, Debug, Data, Lens)]
 pub struct Authentication {
     pub username: String,
     pub password: String,
+    pub access_token: String,
     pub result: Promise<(), (), String>,
 }
 
 impl Authentication {
     pub fn session_config(&self) -> SessionConfig {
         SessionConfig {
-            login_creds: Credentials::from_username_and_password(
-                self.username.to_owned(),
-                self.password.to_owned(),
-            ),
+            login_creds: if !self.access_token.is_empty() {
+                Credentials::from_access_token(self.access_token.clone())
+            } else {
+                Credentials::from_username_and_password(
+                    self.username.clone(),
+                    self.password.clone(),
+                )
+            },
             proxy_url: Config::proxy(),
         }
     }
@@ -58,6 +71,11 @@ impl Authentication {
     pub fn authenticate_and_get_credentials(config: SessionConfig) -> Result<Credentials, String> {
         let connection = SessionConnection::open(config).map_err(|err| err.to_string())?;
         Ok(connection.credentials)
+    }
+
+    pub fn clear(&mut self) {
+        self.username.clear();
+        self.password.clear();
     }
 }
 
@@ -76,6 +94,12 @@ pub struct Config {
     pub last_route: Option<Nav>,
     pub queue_behavior: QueueBehavior,
     pub show_track_cover: bool,
+    pub window_size: Size,
+    pub slider_scroll_scale: SliderScrollScale,
+    pub sort_order: SortOrder,
+    pub sort_criteria: SortCriteria,
+    pub paginated_limit: usize,
+    pub seek_duration: usize,
 }
 
 impl Default for Config {
@@ -88,6 +112,12 @@ impl Default for Config {
             last_route: Default::default(),
             queue_behavior: Default::default(),
             show_track_cover: Default::default(),
+            window_size: Size::new(theme::grid(80.0), theme::grid(100.0)),
+            slider_scroll_scale: Default::default(),
+            sort_order: Default::default(),
+            sort_criteria: Default::default(),
+            paginated_limit: 500,
+            seek_duration: 10,
         }
     }
 }
@@ -122,7 +152,8 @@ impl Config {
         let path = Self::config_path().expect("Failed to get config path");
         if let Ok(file) = File::open(&path) {
             log::info!("loading config: {:?}", &path);
-            Some(serde_json::from_reader(file).expect("Failed to read config"))
+            let reader = BufReader::new(file);
+            Some(serde_json::from_reader(reader).expect("Failed to read config"))
         } else {
             None
         }
@@ -132,8 +163,16 @@ impl Config {
         let dir = Self::config_dir().expect("Failed to get config dir");
         let path = Self::config_path().expect("Failed to get config path");
         mkdir_if_not_exists(&dir).expect("Failed to create config dir");
-        let file = File::create(&path).expect("Failed to create config");
-        serde_json::to_writer_pretty(file, self).expect("Failed to write config");
+
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(target_family = "unix")]
+        options.mode(0o600);
+
+        let file = options.open(&path).expect("Failed to create config");
+        let writer = BufWriter::new(file);
+
+        serde_json::to_writer_pretty(writer, self).expect("Failed to write config");
         log::info!("saved config: {:?}", &path);
     }
 
@@ -145,8 +184,14 @@ impl Config {
         self.credentials.replace(credentials);
     }
 
+    pub fn clear_credentials(&mut self) {
+        self.credentials = Default::default();
+    }
+
     pub fn username(&self) -> Option<&str> {
-        self.credentials.as_ref().map(|c| c.username.as_str())
+        self.credentials
+            .as_ref()
+            .and_then(|c| c.username.as_deref())
     }
 
     pub fn session(&self) -> SessionConfig {
@@ -209,5 +254,30 @@ pub enum Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::Light
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Data, Serialize, Deserialize)]
+pub enum SortOrder {
+    Ascending,
+    Descending,
+}
+impl Default for SortOrder {
+    fn default() -> Self {
+        Self::Ascending
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Data, Serialize, Deserialize)]
+pub enum SortCriteria {
+    Title,
+    Artist,
+    Album,
+    Duration,
+    DateAdded,
+}
+impl Default for SortCriteria {
+    fn default() -> Self {
+        Self::DateAdded
     }
 }

@@ -40,11 +40,10 @@ pub fn playable_widget() -> impl Widget<PlayRow<Arc<Episode>>> {
 
     let is_playing = playable::is_playing_marker_widget().lens(PlayRow::is_playing);
 
-    let duration =
-        Label::<Arc<Episode>>::dynamic(|episode, _| utils::as_human(episode.duration).to_string())
-            .with_text_size(theme::TEXT_SIZE_SMALL)
-            .with_text_color(theme::PLACEHOLDER_COLOR)
-            .lens(PlayRow::item);
+    let duration = Label::<Arc<Episode>>::dynamic(|episode, _| utils::as_human(episode.duration))
+        .with_text_size(theme::TEXT_SIZE_SMALL)
+        .with_text_color(theme::PLACEHOLDER_COLOR)
+        .lens(PlayRow::item);
 
     Flex::column()
         .cross_axis_alignment(CrossAxisAlignment::Start)
@@ -75,7 +74,7 @@ pub fn playable_widget() -> impl Widget<PlayRow<Arc<Episode>>> {
         .padding(theme::grid(1.0))
         .link()
         .rounded(theme::BUTTON_BORDER_RADIUS)
-        .on_click(|ctx, row, _| ctx.submit_notification(cmd::PLAY.with(row.position)))
+        .on_left_click(|ctx, _, row, _| ctx.submit_notification(cmd::PLAY.with(row.position)))
         .context_menu(episode_row_menu)
 }
 
@@ -100,7 +99,7 @@ pub fn episode_menu(episode: &Episode, _library: &Arc<Library>) -> Menu<AppState
     let mut menu = Menu::empty();
 
     menu = menu.entry(
-        MenuItem::new(LocalizedString::new("menu-item-show-show").with_placeholder("Go To Show"))
+        MenuItem::new(LocalizedString::new("menu-item-show-show").with_placeholder("Go to Show"))
             .command(cmd::NAVIGATE.with(Nav::ShowDetail(episode.show.clone()))),
     );
 

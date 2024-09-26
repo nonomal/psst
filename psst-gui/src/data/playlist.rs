@@ -18,14 +18,21 @@ pub struct PlaylistAddTrack {
 }
 
 #[derive(Clone, Debug, Data, Lens, Deserialize)]
+pub struct PlaylistRemoveTrack {
+    pub link: PlaylistLink,
+    pub track_pos: usize,
+}
+
+#[derive(Clone, Debug, Data, Lens, Deserialize)]
 pub struct Playlist {
     pub id: Arc<str>,
     pub name: Arc<str>,
-    pub images: Vector<Image>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vector<Image>>,
     pub description: Arc<str>,
     #[serde(rename = "tracks")]
     #[serde(deserialize_with = "deserialize_track_count")]
-    pub track_count: usize,
+    pub track_count: Option<usize>,
     pub owner: PublicUser,
     pub collaborative: bool,
 }
@@ -39,7 +46,9 @@ impl Playlist {
     }
 
     pub fn image(&self, width: f64, height: f64) -> Option<&Image> {
-        Image::at_least_of_size(&self.images, width, height)
+        self.images
+            .as_ref()
+            .and_then(|images| Image::at_least_of_size(images, width, height))
     }
 
     pub fn url(&self) -> String {
@@ -69,13 +78,13 @@ pub struct PlaylistLink {
     pub name: Arc<str>,
 }
 
-fn deserialize_track_count<'de, D>(deserializer: D) -> Result<usize, D::Error>
+fn deserialize_track_count<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
 where
     D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     struct PlaylistTracksRef {
-        total: usize,
+        total: Option<usize>,
     }
 
     Ok(PlaylistTracksRef::deserialize(deserializer)?.total)

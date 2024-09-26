@@ -1,15 +1,23 @@
 use std::sync::Arc;
 
 use druid::{
-    widget::{CrossAxisAlignment, Either, Flex, Label, List},
+    widget::{CrossAxisAlignment, Either, Flex, Label, ViewSwitcher},
     LensExt, LocalizedString, Menu, MenuItem, Size, TextAlignment, Widget, WidgetExt,
+};
+use psst_core::{
+    audio::normalize::NormalizationLevel,
+    item_id::{ItemId, ItemIdType},
+    player::item::PlaybackItem,
 };
 
 use crate::{
     cmd,
-    data::{AppState, ArtistLink, Library, Nav, PlaylistAddTrack, RecommendationsRequest, Track},
+    data::{
+        AppState, Library, Nav, PlaybackOrigin, PlaylistAddTrack, PlaylistRemoveTrack, QueueEntry,
+        RecommendationsRequest, Track,
+    },
     ui::playlist,
-    widget::{Empty, MyWidgetExt, RemoteImage},
+    widget::{icons, Empty, MyWidgetExt, RemoteImage},
 };
 
 use super::{
@@ -42,7 +50,7 @@ impl Display {
     }
 }
 
-pub fn playable_widget(display: Display) -> impl Widget<PlayRow<Arc<Track>>> {
+pub fn playable_widget(track: &Track, display: Display) -> impl Widget<PlayRow<Arc<Track>>> {
     let mut main_row = Flex::row();
     let mut major = Flex::row();
     let mut minor = Flex::row();
@@ -81,15 +89,15 @@ pub fn playable_widget(display: Display) -> impl Widget<PlayRow<Arc<Track>>> {
         major.add_child(track_name);
     }
 
+    if track.explicit && (display.artist || display.album) {
+        let icon = icons::EXPLICIT.scale(theme::ICON_SIZE_TINY);
+        minor.add_child(icon);
+        minor.add_spacer(theme::grid(0.5));
+    }
+
     if display.artist {
-        let track_artists = List::new(|| {
-            Label::raw()
-                .with_text_size(theme::TEXT_SIZE_SMALL)
-                .lens(ArtistLink::name)
-        })
-        .horizontal()
-        .with_spacing(theme::grid(0.5))
-        .lens(PlayRow::item.then(Track::artists.in_arc()));
+        let track_artists = Label::dynamic(|row: &PlayRow<Arc<Track>>, _| row.item.artist_names())
+            .with_text_size(theme::TEXT_SIZE_SMALL);
         minor.add_child(track_artists);
     }
 
@@ -127,20 +135,51 @@ pub fn playable_widget(display: Display) -> impl Widget<PlayRow<Arc<Track>>> {
     major.add_default_spacer();
     major.add_child(track_duration);
 
+    let saved = ViewSwitcher::new(
+        |row: &PlayRow<Arc<Track>>, _| row.ctx.library.saved_tracks.is_resolved(),
+        |selector: &bool, _, _| match selector {
+            true => ViewSwitcher::new(
+                |row: &PlayRow<Arc<Track>>, _| row.ctx.library.contains_track(&row.item),
+                |selector: &bool, _, _| {
+                    match selector {
+                        true => &icons::CIRCLE_CHECK,
+                        false => &icons::CIRCLE_PLUS,
+                    }
+                    .scale(theme::ICON_SIZE_SMALL)
+                    .boxed()
+                },
+            )
+            .on_left_click(|ctx, _, row, _| {
+                let track = &row.item;
+                if row.ctx.library.contains_track(track) {
+                    ctx.submit_command(library::UNSAVE_TRACK.with(track.id))
+                } else {
+                    ctx.submit_command(library::SAVE_TRACK.with(track.clone()))
+                }
+            })
+            .boxed(),
+            false => Box::new(Flex::column()),
+        },
+    );
+
     main_row
         .with_flex_child(
             Flex::column()
                 .cross_axis_alignment(CrossAxisAlignment::Start)
                 .with_child(major)
                 .with_spacer(2.0)
-                .with_child(minor),
+                .with_child(minor)
+                .on_left_click(|ctx, _, row, _| {
+                    ctx.submit_notification(cmd::PLAY.with(row.position))
+                }),
             1.0,
         )
+        .with_default_spacer()
+        .with_child(saved)
         .padding(theme::grid(1.0))
         .link()
         .active(|row, _| row.is_playing)
         .rounded(theme::BUTTON_BORDER_RADIUS)
-        .on_click(|ctx, row, _| ctx.submit_notification(cmd::PLAY.with(row.position)))
         .context_menu(track_row_menu)
 }
 
@@ -176,19 +215,24 @@ fn popularity_stars(popularity: u32) -> String {
 }
 
 fn track_row_menu(row: &PlayRow<Arc<Track>>) -> Menu<AppState> {
-    track_menu(&row.item, &row.ctx.library)
+    track_menu(&row.item, &row.ctx.library, &row.origin, row.item.track_pos)
 }
 
-pub fn track_menu(track: &Arc<Track>, library: &Arc<Library>) -> Menu<AppState> {
+pub fn track_menu(
+    track: &Arc<Track>,
+    library: &Library,
+    origin: &PlaybackOrigin,
+    track_pos: usize,
+) -> Menu<AppState> {
     let mut menu = Menu::empty();
 
     for artist_link in &track.artists {
         let more_than_one_artist = track.artists.len() > 1;
         let title = if more_than_one_artist {
             LocalizedString::new("menu-item-show-artist-name")
-                .with_placeholder(format!("Go To Artist “{}”", artist_link.name))
+                .with_placeholder(format!("Go to Artist “{}”", artist_link.name))
         } else {
-            LocalizedString::new("menu-item-show-artist").with_placeholder("Go To Artist")
+            LocalizedString::new("menu-item-show-artist").with_placeholder("Go to Artist")
         };
         menu = menu.entry(
             MenuItem::new(title)
@@ -199,7 +243,7 @@ pub fn track_menu(track: &Arc<Track>, library: &Arc<Library>) -> Menu<AppState> 
     if let Some(album_link) = track.album.as_ref() {
         menu = menu.entry(
             MenuItem::new(
-                LocalizedString::new("menu-item-show-album").with_placeholder("Go To Album"),
+                LocalizedString::new("menu-item-show-album").with_placeholder("Go to Album"),
             )
             .command(cmd::NAVIGATE.with(Nav::AlbumDetail(album_link.to_owned()))),
         );
@@ -241,6 +285,66 @@ pub fn track_menu(track: &Arc<Track>, library: &Arc<Library>) -> Menu<AppState> 
             .command(library::SAVE_TRACK.with(track.clone())),
         );
     }
+
+    if let PlaybackOrigin::Playlist(playlist) = origin {
+        // Do some (hopefully) quick checks to determine if we should give the
+        // option to remove items from this playlist, only allowing it if the
+        // playlist is collaborative or we are the owner of it
+        let should_show = {
+            if let Some(details) = library
+                .playlists
+                .resolved()
+                .and_then(|pl| pl.iter().find(|p| p.id == playlist.id))
+            {
+                if details.collaborative {
+                    true
+                } else if let Some(user) = library.user_profile.resolved() {
+                    user.id == details.owner.id
+                } else {
+                    // If we can find the playlist, but for some reason can't
+                    // resolve our own user, just show the option anyways and
+                    // we'll see an error at the bottom if it doesn't work
+                    // when they try to remove a track
+                    true
+                }
+            } else {
+                // If this playlist doesn't exist in our library,
+                // just assume that we can't edit it since we probably
+                // searched for it or something
+                false
+            }
+        };
+
+        if should_show {
+            menu = menu.entry(
+                MenuItem::new(
+                    LocalizedString::new("menu-item-remove-from-playlist")
+                        .with_placeholder("Remove from Current Playlist"),
+                )
+                .command(playlist::REMOVE_TRACK.with(PlaylistRemoveTrack {
+                    link: playlist.to_owned(),
+                    track_pos,
+                })),
+            );
+        }
+    }
+
+    menu = menu.entry(
+        MenuItem::new(
+            LocalizedString::new("menu-item-add-to-queue").with_placeholder("Add Track to Queue"),
+        )
+        // PlayerCommand
+        .command(cmd::ADD_TO_QUEUE.with((
+            QueueEntry {
+                item: crate::ui::Playable::Track(track.clone()),
+                origin: origin.clone(),
+            },
+            PlaybackItem {
+                item_id: ItemId::from_base62(&String::from(track.id), ItemIdType::Track).unwrap(),
+                norm_level: NormalizationLevel::Track,
+            },
+        ))),
+    );
 
     let mut playlist_menu = Menu::new(
         LocalizedString::new("menu-item-add-to-playlist").with_placeholder("Add to Playlist"),

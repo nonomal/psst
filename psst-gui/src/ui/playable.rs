@@ -14,7 +14,7 @@ use crate::{
     data::{
         Album, ArtistTracks, CommonCtx, FindQuery, MatchFindQuery, Playable, PlaybackOrigin,
         PlaybackPayload, PlaylistTracks, Recommendations, SavedTracks, SearchResults, ShowEpisodes,
-        WithCtx,
+        Track, WithCtx,
     },
     ui::theme,
 };
@@ -55,7 +55,7 @@ fn playable_widget(display: Display) -> impl Widget<PlayRow<Playable>> {
         |row: &PlayRow<Playable>, _| mem::discriminant(&row.item),
         move |_, row: &PlayRow<Playable>, _| match row.item.clone() {
             // TODO: Do the lenses some other way.
-            Playable::Track(track) => track::playable_widget(display.track)
+            Playable::Track(track) => track::playable_widget(&track, display.track)
                 .lens(Map::new(
                     move |pb: &PlayRow<Playable>| pb.with(track.clone()),
                     |_, _| {
@@ -96,6 +96,7 @@ pub fn is_playing_marker_widget() -> impl Widget<bool> {
 pub struct PlayRow<T> {
     pub item: T,
     pub ctx: Arc<CommonCtx>,
+    pub origin: Arc<PlaybackOrigin>,
     pub position: usize,
     pub is_playing: bool,
 }
@@ -105,6 +106,7 @@ impl<T> PlayRow<T> {
         PlayRow {
             item,
             ctx: self.ctx.clone(),
+            origin: self.origin.clone(),
             position: self.position,
             is_playing: self.is_playing,
         }
@@ -147,6 +149,24 @@ impl PlayableIter for Arc<Album> {
 
     fn count(&self) -> usize {
         self.tracks.len()
+    }
+}
+
+// This should change to a more specific name as it could be confusing for others
+// As at the moment this is only used for the home page!
+impl PlayableIter for Vector<Arc<Track>> {
+    fn origin(&self) -> PlaybackOrigin {
+        PlaybackOrigin::Home
+    }
+
+    fn for_each(&self, mut cb: impl FnMut(Playable, usize)) {
+        for (position, track) in self.iter().enumerate() {
+            cb(Playable::Track(track.to_owned()), position);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.len()
     }
 }
 
@@ -251,11 +271,13 @@ where
     T: PlayableIter + Data,
 {
     fn for_each(&self, mut cb: impl FnMut(&PlayRow<Playable>, usize)) {
+        let origin = Arc::new(self.data.origin());
         self.data.for_each(|item, position| {
             cb(
                 &PlayRow {
                     is_playing: self.ctx.is_playing(&item),
                     ctx: self.ctx.to_owned(),
+                    origin: origin.clone(),
                     item,
                     position,
                 },
@@ -265,11 +287,13 @@ where
     }
 
     fn for_each_mut(&mut self, mut cb: impl FnMut(&mut PlayRow<Playable>, usize)) {
+        let origin = Arc::new(self.data.origin());
         self.data.for_each(|item, position| {
             cb(
                 &mut PlayRow {
                     is_playing: self.ctx.is_playing(&item),
                     ctx: self.ctx.to_owned(),
+                    origin: origin.clone(),
                     item,
                     position,
                 },

@@ -61,7 +61,7 @@ impl PlaybackController {
             &output,
         );
 
-        self.media_controls = Self::create_media_controls(player.sender(), &window)
+        self.media_controls = Self::create_media_controls(player.sender(), window)
             .map_err(|err| log::error!("failed to connect to media control interface: {:?}", err))
             .ok();
 
@@ -130,7 +130,7 @@ impl PlaybackController {
             {
                 use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
                 let handle = match window.raw_window_handle() {
-                    RawWindowHandle::Windows(h) => h,
+                    RawWindowHandle::Win32(h) => h,
                     _ => unreachable!(),
                 };
                 Some(handle.hwnd)
@@ -159,6 +159,9 @@ impl PlaybackController {
             MediaControlEvent::Toggle => PlayerEvent::Command(PlayerCommand::PauseOrResume),
             MediaControlEvent::Next => PlayerEvent::Command(PlayerCommand::Next),
             MediaControlEvent::Previous => PlayerEvent::Command(PlayerCommand::Previous),
+            MediaControlEvent::SetPosition(MediaPosition(duration)) => {
+                PlayerEvent::Command(PlayerCommand::Seek { position: duration })
+            }
             _ => {
                 return;
             }
@@ -213,22 +216,32 @@ impl PlaybackController {
     }
 
     fn send(&mut self, event: PlayerEvent) {
-        self.sender.as_mut().unwrap().send(event).unwrap();
+        if let Some(s) = &self.sender {
+            s.send(event)
+                .map_err(|e| log::error!("Error sending message: {:?}", e))
+                .ok();
+        }
     }
 
     fn play(&mut self, items: &Vector<QueueEntry>, position: usize) {
-        let items = items
-            .iter()
-            .map(|queued| PlaybackItem {
-                item_id: queued.item.id(),
-                norm_level: match queued.origin {
-                    PlaybackOrigin::Album(_) => NormalizationLevel::Album,
-                    _ => NormalizationLevel::Track,
-                },
-            })
-            .collect();
+        let playback_items = items.iter().map(|queued| PlaybackItem {
+            item_id: queued.item.id(),
+            norm_level: match queued.origin {
+                PlaybackOrigin::Album(_) => NormalizationLevel::Album,
+                _ => NormalizationLevel::Track,
+            },
+        });
+        let playback_items_vec: Vec<PlaybackItem> = playback_items.collect();
+
+        // Make sure position is within bounds
+        let position = if position >= playback_items_vec.len() {
+            0
+        } else {
+            position
+        };
+
         self.send(PlayerEvent::Command(PlayerCommand::LoadQueue {
-            items,
+            items: playback_items_vec,
             position,
         }));
     }
@@ -261,8 +274,30 @@ impl PlaybackController {
         self.send(PlayerEvent::Command(PlayerCommand::Seek { position }));
     }
 
+    fn seek_relative(&mut self, data: &AppState, forward: bool) {
+        if let Some(now_playing) = &data.playback.now_playing {
+            let seek_duration = Duration::from_secs(data.config.seek_duration as u64);
+
+            // Calculate new position, ensuring it does not exceed duration for forward seeks.
+            let seek_position = if forward {
+                now_playing.progress + seek_duration
+            } else {
+                now_playing.progress.saturating_sub(seek_duration)
+            }
+            .min(now_playing.item.duration()); // Safeguard to not exceed the track duration.
+
+            self.seek(seek_position);
+        }
+    }
+
     fn set_volume(&mut self, volume: f64) {
         self.send(PlayerEvent::Command(PlayerCommand::SetVolume { volume }));
+    }
+
+    fn add_to_queue(&mut self, item: &PlaybackItem) {
+        self.send(PlayerEvent::Command(PlayerCommand::AddToQueue {
+            item: *item,
+        }));
     }
 
     fn set_queue_behavior(&mut self, behavior: QueueBehavior) {
@@ -321,6 +356,7 @@ where
             Event::Command(cmd) if cmd.is(cmd::PLAYBACK_PROGRESS) => {
                 let progress = cmd.get_unchecked(cmd::PLAYBACK_PROGRESS);
                 data.progress_playback(progress.to_owned());
+                self.update_media_control_playback(&data.playback);
                 ctx.set_handled();
             }
             Event::Command(cmd) if cmd.is(cmd::PLAYBACK_PAUSING) => {
@@ -376,6 +412,14 @@ where
                 self.stop();
                 ctx.set_handled();
             }
+            Event::Command(cmd) if cmd.is(cmd::ADD_TO_QUEUE) => {
+                log::info!("adding to queue");
+                let (entry, item) = cmd.get_unchecked(cmd::ADD_TO_QUEUE);
+
+                self.add_to_queue(item);
+                data.add_queued_entry(entry.clone());
+                ctx.set_handled();
+            }
             Event::Command(cmd) if cmd.is(cmd::PLAY_QUEUE_BEHAVIOR) => {
                 let behavior = cmd.get_unchecked(cmd::PLAY_QUEUE_BEHAVIOR);
                 data.set_queue_behavior(behavior.to_owned());
@@ -398,11 +442,19 @@ where
                 ctx.set_handled();
             }
             Event::KeyDown(key) if key.code == Code::ArrowRight => {
-                self.next();
+                if key.mods.shift() {
+                    self.next();
+                } else {
+                    self.seek_relative(data, true);
+                }
                 ctx.set_handled();
             }
             Event::KeyDown(key) if key.code == Code::ArrowLeft => {
-                self.previous();
+                if key.mods.shift() {
+                    self.previous();
+                } else {
+                    self.seek_relative(data, false);
+                }
                 ctx.set_handled();
             }
             Event::KeyDown(key) if key.key == KbKey::Character("+".to_string()) => {

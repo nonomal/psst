@@ -10,16 +10,19 @@ use druid::{
 use itertools::Itertools;
 
 use crate::{
-    cmd,
+    cmd::{self, ADD_TO_QUEUE},
     controller::PlaybackController,
     data::{
         AppState, AudioAnalysis, Episode, NowPlaying, Playable, PlayableMatcher, Playback,
         PlaybackOrigin, PlaybackState, QueueBehavior, ShowLink, Track,
     },
-    widget::{icons, icons::SvgIcon, Empty, Maybe, MyWidgetExt, RemoteImage},
+    widget::{
+        icons::{self, SvgIcon},
+        Empty, Maybe, MyWidgetExt, RemoteImage,
+    },
 };
 
-use super::{episode, theme, track, utils};
+use super::{episode, library, theme, track, utils};
 
 pub fn panel_widget() -> impl Widget<AppState> {
     let seek_bar = Maybe::or_empty(SeekBar::new).lens(Playback::now_playing);
@@ -34,6 +37,9 @@ pub fn panel_widget() -> impl Widget<AppState> {
         .with_child(BarLayout::new(item_info, controls))
         .lens(AppState::playback)
         .controller(PlaybackController::new())
+        .on_command(ADD_TO_QUEUE, |_, _, data| {
+            data.info_alert("Track added to queue.")
+        })
 }
 
 fn playing_item_widget() -> impl Widget<NowPlaying> {
@@ -89,26 +95,71 @@ fn playing_item_widget() -> impl Widget<NowPlaying> {
 
     Flex::row()
         .with_child(cover_art)
-        .with_spacer(theme::grid(2.0))
         .with_flex_child(
-            Flex::column()
-                .cross_axis_alignment(CrossAxisAlignment::Start)
-                .with_child(name)
-                .with_spacer(2.0)
-                .with_child(detail)
-                .with_spacer(2.0)
-                .with_child(origin),
+            Flex::row().with_spacer(theme::grid(2.0)).with_flex_child(
+                Flex::column()
+                    .cross_axis_alignment(CrossAxisAlignment::Start)
+                    .with_child(name)
+                    .with_spacer(2.0)
+                    .with_child(detail)
+                    .with_spacer(2.0)
+                    .with_child(origin)
+                    .on_click(|ctx, now_playing, _| {
+                        ctx.submit_command(cmd::NAVIGATE.with(now_playing.origin.to_nav()));
+                    })
+                    .context_menu(|now_playing| match &now_playing.item {
+                        Playable::Track(track) => track::track_menu(
+                            track,
+                            &now_playing.library,
+                            &now_playing.origin,
+                            usize::MAX,
+                        ),
+                        Playable::Episode(episode) => {
+                            episode::episode_menu(episode, &now_playing.library)
+                        }
+                    }),
+                1.0,
+            ),
             1.0,
         )
+        .with_child(ViewSwitcher::new(
+            |now_playing: &NowPlaying, _| {
+                now_playing.item.track().is_some() && now_playing.library.saved_tracks.is_resolved()
+            },
+            |selector, _data, _env| match selector {
+                true => {
+                    // View is only show if now_playing's track isn't none
+                    ViewSwitcher::new(
+                        |now_playing: &NowPlaying, _| {
+                            now_playing
+                                .library
+                                .contains_track(now_playing.item.track().unwrap())
+                        },
+                        |selector: &bool, _, _| {
+                            match selector {
+                                true => &icons::CIRCLE_CHECK,
+                                false => &icons::CIRCLE_PLUS,
+                            }
+                            .scale(theme::ICON_SIZE_SMALL)
+                            .boxed()
+                        },
+                    )
+                    .on_left_click(|ctx, _, now_playing, _| {
+                        let track = now_playing.item.track().unwrap();
+                        if now_playing.library.contains_track(track) {
+                            ctx.submit_command(library::UNSAVE_TRACK.with(track.id))
+                        } else {
+                            ctx.submit_command(library::SAVE_TRACK.with(track.clone()))
+                        }
+                    })
+                    .padding(theme::grid(1.0))
+                    .boxed()
+                }
+                false => Box::new(Flex::column()),
+            },
+        ))
         .padding(theme::grid(1.0))
         .link()
-        .on_click(|ctx, now_playing, _| {
-            ctx.submit_command(cmd::NAVIGATE.with(now_playing.origin.to_nav()));
-        })
-        .context_menu(|now_playing| match &now_playing.item {
-            Playable::Track(track) => track::track_menu(track, &now_playing.library),
-            Playable::Episode(episode) => episode::episode_menu(episode, &now_playing.library),
-        })
 }
 
 fn cover_widget(size: f64) -> impl Widget<NowPlaying> {
@@ -121,6 +172,7 @@ fn cover_widget(size: f64) -> impl Widget<NowPlaying> {
 
 fn playback_origin_icon(origin: &PlaybackOrigin) -> &'static SvgIcon {
     match origin {
+        PlaybackOrigin::Home => &icons::HOME,
         PlaybackOrigin::Library => &icons::HEART,
         PlaybackOrigin::Album { .. } => &icons::ALBUM,
         PlaybackOrigin::Artist { .. } => &icons::ARTIST,
@@ -135,14 +187,14 @@ fn player_widget() -> impl Widget<Playback> {
     Flex::row()
         .with_child(
             small_button_widget(&icons::SKIP_BACK)
-                .on_click(|ctx, _, _| ctx.submit_command(cmd::PLAY_PREVIOUS)),
+                .on_left_click(|ctx, _, _, _| ctx.submit_command(cmd::PLAY_PREVIOUS)),
         )
         .with_default_spacer()
         .with_child(player_play_pause_widget())
         .with_default_spacer()
         .with_child(
             small_button_widget(&icons::SKIP_FORWARD)
-                .on_click(|ctx, _, _| ctx.submit_command(cmd::PLAY_NEXT)),
+                .on_left_click(|ctx, _, _, _| ctx.submit_command(cmd::PLAY_NEXT)),
         )
         .with_default_spacer()
         .with_child(queue_behavior_widget())
@@ -162,7 +214,7 @@ fn player_play_pause_widget() -> impl Widget<Playback> {
                 .link()
                 .circle()
                 .border(theme::GREY_600, 1.0)
-                .on_click(|ctx, _, _| ctx.submit_command(cmd::PLAY_STOP))
+                .on_left_click(|ctx, _, _, _| ctx.submit_command(cmd::PLAY_STOP))
                 .boxed(),
             PlaybackState::Playing => icons::PAUSE
                 .scale((theme::grid(3.0), theme::grid(3.0)))
@@ -170,7 +222,7 @@ fn player_play_pause_widget() -> impl Widget<Playback> {
                 .link()
                 .circle()
                 .border(theme::GREY_500, 1.0)
-                .on_click(|ctx, _, _| ctx.submit_command(cmd::PLAY_PAUSE))
+                .on_left_click(|ctx, _, _, _| ctx.submit_command(cmd::PLAY_PAUSE))
                 .boxed(),
             PlaybackState::Paused => icons::PLAY
                 .scale((theme::grid(3.0), theme::grid(3.0)))
@@ -178,7 +230,7 @@ fn player_play_pause_widget() -> impl Widget<Playback> {
                 .link()
                 .circle()
                 .border(theme::GREY_500, 1.0)
-                .on_click(|ctx, _, _| ctx.submit_command(cmd::PLAY_RESUME))
+                .on_left_click(|ctx, _, _, _| ctx.submit_command(cmd::PLAY_RESUME))
                 .boxed(),
             PlaybackState::Stopped => Empty.boxed(),
         },
@@ -190,7 +242,7 @@ fn queue_behavior_widget() -> impl Widget<Playback> {
         |playback: &Playback, _| playback.queue_behavior,
         |behavior, _, _| {
             faded_button_widget(queue_behavior_icon(behavior))
-                .on_click(|ctx, playback: &mut Playback, _| {
+                .on_left_click(|ctx, _, playback: &mut Playback, _| {
                     ctx.submit_command(
                         cmd::PLAY_QUEUE_BEHAVIOR
                             .with(cycle_queue_behavior(&playback.queue_behavior)),
@@ -309,7 +361,7 @@ where
         let total = Size::new(max.width, player.height.max(item.height));
 
         // Put the item to the top left.
-        self.item.set_origin(ctx, data, env, Point::ORIGIN);
+        self.item.set_origin(ctx, Point::ORIGIN);
 
         // Put the player either to the center or to the right.
         let player_pos = if player_centered {
@@ -323,7 +375,7 @@ where
                 total.height * 0.5 - player.height * 0.5,
             )
         };
-        self.player.set_origin(ctx, data, env, player_pos);
+        self.player.set_origin(ctx, player_pos);
 
         total
     }
@@ -496,9 +548,9 @@ fn paint_audio_analysis(ctx: &mut PaintCtx, data: &NowPlaying, path: &BezPath, e
     };
 
     ctx.with_save(|ctx| {
-        ctx.fill(&path, &remaining_color);
-        ctx.clip(&elapsed);
-        ctx.fill(&path, &elapsed_color);
+        ctx.fill(path, &remaining_color);
+        ctx.clip(elapsed);
+        ctx.fill(path, &elapsed_color);
     });
 }
 
@@ -520,11 +572,11 @@ fn paint_progress_bar(ctx: &mut PaintCtx, data: &NowPlaying, env: &Env) {
     let remaining = Size::new(remaining_width, bounds.height).round();
 
     ctx.fill(
-        &Rect::from_origin_size(Point::ORIGIN, elapsed),
+        Rect::from_origin_size(Point::ORIGIN, elapsed),
         &elapsed_color,
     );
     ctx.fill(
-        &Rect::from_origin_size(Point::new(elapsed.width, 0.0), remaining),
+        Rect::from_origin_size(Point::new(elapsed.width, 0.0), remaining),
         &remaining_color,
     );
 }
